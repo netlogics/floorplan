@@ -99,7 +99,9 @@ const LANG_BY_EXT = {
   '.go': 'go', '.rs': 'rust', '.java': 'java', '.kt': 'kotlin', '.kts': 'kotlin', '.scala': 'scala',
   '.cs': 'csharp', '.fs': 'fsharp', '.rb': 'ruby', '.php': 'php', '.swift': 'swift', '.dart': 'dart',
   '.c': 'c', '.h': 'c', '.cc': 'cpp', '.cpp': 'cpp', '.cxx': 'cpp', '.hpp': 'cpp', '.hh': 'cpp', '.m': 'objc', '.mm': 'objc',
-  '.ex': 'elixir', '.exs': 'elixir', '.erl': 'erlang', '.clj': 'clojure', '.lua': 'lua', '.r': 'r', '.jl': 'julia',
+  '.ex': 'elixir', '.exs': 'elixir', '.erl': 'erlang', '.lua': 'lua', '.r': 'r', '.jl': 'julia',
+  // Clojure: one language id for every dialect (.cljc is read by both .clj and .cljs, so it isn't separate)
+  '.clj': 'clojure', '.cljs': 'clojure', '.cljc': 'clojure', '.bb': 'clojure',
   '.zig': 'zig', '.elm': 'elm', '.hs': 'haskell', '.ml': 'ocaml', '.groovy': 'groovy',
   '.sh': 'shell', '.bash': 'shell', '.zsh': 'shell', '.ps1': 'powershell', '.psm1': 'powershell',
   '.sql': 'sql', '.tf': 'terraform', '.proto': 'protobuf', '.graphql': 'graphql', '.gql': 'graphql',
@@ -110,7 +112,7 @@ const THEME_JSON = /^(templates\/(customers\/|metaobject\/)?[^/]+|sections\/[^/]
 const THEME_FILE = 'layout/theme.liquid';
 /** Shopify theme folders as path prefixes ('' for the root): every theme has a layout/theme.liquid. */
 export const themeRoots = (paths) => new Set(paths.filter((p) => p === THEME_FILE || p.endsWith('/' + THEME_FILE)).map((p) => p.slice(0, -THEME_FILE.length)));
-const CONFIG_EXT = new Set(['.json', '.yaml', '.yml', '.toml', '.ini', '.cfg', '.conf', '.xml', '.gradle', '.properties', '.env']);
+const CONFIG_EXT = new Set(['.json', '.yaml', '.yml', '.toml', '.edn', '.ini', '.cfg', '.conf', '.xml', '.gradle', '.properties', '.env']);
 const CONFIG_NAMES = /^(dockerfile.*|makefile|procfile|justfile|\.env\..*|\.?[\w-]*rc|gemfile|rakefile|cargo\.toml|go\.mod|pyproject\.toml|setup\.cfg|requirements.*\.txt)$/i;
 const JSON_CONFIG = /^(package|tsconfig.*|jsconfig|composer|manifest|app|components|turbo|nx|lerna|angular|firebase|vercel|now|renovate|tslint|.?eslintrc|.?babelrc|.?prettierrc|.*.config|.*rc|settings|launch|tasks|deno|biome|project|workspace|devcontainer|cdk|serverless|appsettings.*|openapi|swagger).json$/i;
 const DOC_EXT = new Set(['.md', '.mdx', '.rst', '.adoc', '.txt']);

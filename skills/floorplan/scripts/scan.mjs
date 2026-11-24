@@ -298,7 +298,9 @@ printTree(tree, '  ', 0);
 line();
 
 // entrypoint candidates
-const ENTRY = /(^|\/)(main|index|app|server|cli|manage|wsgi|asgi|__main__|program|lib)\.(py|ts|tsx|js|mjs|go|rs|java|kt|cs|rb)$|(^|\/)app\/(page|layout)\.(t|j)sx?$|(^|\/)cmd\/[^/]+\/main\.go$|(^|\/)Dockerfile[^/]*$|(^|\/)(docker-compose|compose)\.ya?ml$|(^|\/)(cloudbuild|serverless|vercel|netlify|fly|render|app)\.(ya?ml|json|toml)$/i;
+// A Clojure project's way in is a -main ns, usually main.clj: deps.edn and bb.edn are manifests like
+// package.json and go.mod, which this list has never held, so they stay out of it too.
+const ENTRY = /(^|\/)(main|index|app|server|cli|manage|wsgi|asgi|__main__|program|lib)\.(py|ts|tsx|js|mjs|go|rs|java|kt|cs|rb|clj|cljs|cljc|bb)$|(^|\/)app\/(page|layout)\.(t|j)sx?$|(^|\/)cmd\/[^/]+\/main\.go$|(^|\/)Dockerfile[^/]*$|(^|\/)(docker-compose|compose)\.ya?ml$|(^|\/)(cloudbuild|serverless|vercel|netlify|fly|render|app)\.(ya?ml|json|toml)$/i;
 const entries = scan.files.filter((f) => ENTRY.test(f.path) && f.path.split('/').length <= 5).map((f) => f.path);
 line(`ENTRYPOINT / DEPLOY CANDIDATES (${entries.length})`);
 for (const e of entries.slice(0, 30)) line(`  ${e}`);

@@ -42,6 +42,16 @@ test('classify: code, docs, lock files, assets and generated files', () => {
   assert.equal(classify('dist/app.min.js', 10).category, 'generated');
 });
 
+test('classify: every Clojure dialect is code, EDN is config', () => {
+  for (const p of ['src/app/core.clj', 'src/app/views.cljs', 'src/app/shared.cljc', 'script/build.bb']) {
+    assert.deepEqual(classify(p, 100), { category: 'code', lang: 'clojure' }, p);
+  }
+  // deps.edn, bb.edn and shadow-cljs.edn are settings, not code
+  for (const p of ['deps.edn', 'bb.edn', 'shadow-cljs.edn', 'resources/config.edn']) {
+    assert.deepEqual(classify(p, 100), { category: 'config', lang: 'edn' }, p);
+  }
+});
+
 test('parseArgs: positionals, --flag value, --flag=value and bare flags', () => {
   assert.deepEqual(parseArgs(['root', '--port', '9', '--no-open', '--x=1']), { _: ['root'], port: '9', 'no-open': true, x: '1' });
 });
