@@ -2087,6 +2087,373 @@ function extractSimple(src, lang) {
   return { imports, symbols, routes: [], mounts: [], calls, hosts };
 }
 
+// ---------- Clojure ----------
+// A namespace isn't a folder: eca.modules.loader is whatever file says (ns eca.modules.loader), so a file's
+// requires are recorded by namespace name and resolve.mjs finds the file that declares it. Clojure text can be
+// written to make pattern matching slow (an unclosed string, a bracket inside a ; comment, a ) inside a char
+// literal), so the source is tokenized once — strings, characters, comments and #_ discards are dealt with there
+// — and the tokens are walked. Nothing here looks at the text a second time for each form.
+
+const CLJ_TOKEN_BUDGET = 200000; // a denser file than this is read this far: every walk below is a single pass
+const CLJ_DELIM = /[\s,()\[\]{}";]/;
+/** The def forms that name something, and the kind of thing each one makes. */
+const CLJ_DEFS = new Map([
+  ['def', 'val'], ['defonce', 'val'], ['defn', 'function'], ['defn-', 'function'], ['defmacro', 'function'],
+  ['definline', 'function'], ['defmulti', 'function'], ['defmethod', 'function'],
+  ['defprotocol', 'class'], ['defrecord', 'class'], ['deftype', 'class'], ['definterface', 'class'],
+]);
+/** The ns clauses worth reading: what a file reaches for. */
+const CLJ_NS_CLAUSES = new Set([':require', ':require-macros', ':use', ':use-macros', ':import']);
+/** Reader conditionals: every branch counts, since a .cljc file is read by more than one target. */
+const CLJ_BRANCHES = new Set([':clj', ':cljs', ':cljr', ':bb', ':default']);
+/** Tokens that decorate the form after them without being part of it. */
+const CLJ_DECORATION = new Set(['prefix', 'meta', 'tag']);
+
+/** Where the string opening at i ends. A Clojure string runs to its ", and \ steps over the next character. */
+function cljStringEnd(src, i) {
+  for (let j = i + 1; j < src.length;) {
+    const c = src.charCodeAt(j);
+    if (c === 92) { j += 2; continue; }
+    if (c === 34) return j + 1;
+    j++;
+  }
+  return src.length; // unclosed: the rest of the file is that string, and looking again from a later " takes forever
+}
+
+/** Where the character literal starting at the \ at i ends: \newline, \u0041, \\, \; and \( are one character each. */
+function cljCharEnd(src, i) {
+  let j = i + 1;
+  if (j >= src.length) return j;
+  if (/[A-Za-z0-9]/.test(src[j])) { while (j < src.length && j - i <= 8 && /[A-Za-z0-9]/.test(src[j])) j++; return j; }
+  return j + 1;
+}
+
+/** A string's text with its escapes read: a docstring's \n is the line break it stands for. */
+const cljUnescape = (s) => (s.includes('\\')
+  ? s.replace(/\\(u[0-9a-fA-F]{4}|[\s\S])/g, (m, e) => (e.length > 1 ? String.fromCharCode(parseInt(e.slice(1), 16))
+    : e === 'n' ? '\n' : e === 't' ? '\t' : e === 'r' ? '\r' : e))
+  : s);
+
+/** Where the collection whose opener is at i ends, stepping over its strings, characters and ; comments. */
+function cljCollectionEnd(src, i) {
+  let depth = 0;
+  while (i < src.length) {
+    const c = src[i];
+    if (c === '"') { i = cljStringEnd(src, i); continue; }
+    if (c === '\\') { i = cljCharEnd(src, i); continue; }
+    if (c === ';') { const e = src.indexOf('\n', i); i = e < 0 ? src.length : e + 1; continue; }
+    if (c === '#' && src[i + 1] === '"') { i = cljStringEnd(src, i + 1); continue; }
+    if (c === '(' || c === '[' || c === '{') depth++;
+    else if (c === ')' || c === ']' || c === '}') { if (--depth <= 0) return i + 1; }
+    i++;
+  }
+  return src.length;
+}
+
+/**
+ * A file as { k, v, i } tokens: k is open, close, sym, kw, str (regex for #"…"), char, meta, prefix, tag or
+ * discard, v is what it says, and i is where it starts, so line numbers stay right. A discarded form is read as
+ * a discard token and the tokens after it; cljItems is what drops it, which keeps this a single pass.
+ */
+function cljTokens(src) {
+  const toks = [];
+  let i = 0;
+  while (i < src.length && toks.length < CLJ_TOKEN_BUDGET) {
+    const c = src[i];
+    if (c === ' ' || c === '\t' || c === '\n' || c === '\r' || c === '\f' || c === '\v' || c === ',') { i++; continue; }
+    if (c === ';') { const e = src.indexOf('\n', i); i = e < 0 ? src.length : e + 1; continue; }
+    if (c === '"') { const e = cljStringEnd(src, i); toks.push({ k: 'str', v: cljUnescape(src.slice(i + 1, Math.max(i + 1, e - 1))), i }); i = e; continue; }
+    if (c === '(' || c === '[' || c === '{') { toks.push({ k: 'open', v: c, i }); i++; continue; }
+    if (c === ')' || c === ']' || c === '}') { toks.push({ k: 'close', v: c, i }); i++; continue; }
+    if (c === '\\') { toks.push({ k: 'char', i }); i = cljCharEnd(src, i); continue; }
+    if (c === '#') {
+      const d = src[i + 1];
+      if (d === '_') { toks.push({ k: 'discard', i }); i += 2; continue; }
+      if (d === '"') { const e = cljStringEnd(src, i + 1); toks.push({ k: 'str', v: src.slice(i + 2, Math.max(i + 2, e - 1)), i, regex: true }); i = e; continue; }
+      if (d === '(' || d === '{') { toks.push({ k: 'open', v: d, i: i + 1 }); i += 2; continue; } // #(…) and #{…}
+      if (d === '?') { let j = i + 2; if (src[j] === '@') j++; toks.push({ k: 'tag', v: '#?', i }); i = j; continue; }
+      if (d === '\'') { toks.push({ k: 'prefix', i }); i += 2; continue; } // #'var
+      if (d === '!') { const e = src.indexOf('\n', i); i = e < 0 ? src.length : e + 1; continue; } // #!/usr/bin/env bb
+      if (d === '=' || d === '<') { i += 2; continue; } // #= read-eval and #< unreadable
+      let j = i + 1;
+      while (j < src.length && !CLJ_DELIM.test(src[j])) j++; // #inst, #uuid, #js, #my/tag: a tag, then a form
+      toks.push({ k: 'tag', v: src.slice(i + 1, j), i });
+      i = j === i + 1 ? j + 1 : j;
+      continue;
+    }
+    if (c === '^') { // ^{:private true}, ^:private, ^String: kept, so a private def can be named as private
+      let j = i + 1;
+      while (j < src.length && (src[j] === ' ' || src[j] === '\t' || src[j] === ',')) j++;
+      if (src[j] === '{' || src[j] === '(' || src[j] === '[') { const e = cljCollectionEnd(src, j); toks.push({ k: 'meta', v: src.slice(j, e), i }); i = e; continue; }
+      let k = j;
+      while (k < src.length && !CLJ_DELIM.test(src[k])) k++;
+      toks.push({ k: 'meta', v: src.slice(j, k), i });
+      i = k === j ? j + 1 : k;
+      continue;
+    }
+    if (c === '\'' || c === '`' || c === '@') { toks.push({ k: 'prefix', i }); i++; continue; }
+    if (c === '~') { toks.push({ k: 'prefix', i }); i += src[i + 1] === '@' ? 2 : 1; continue; }
+    let j = i;
+    while (j < src.length && j - i < 300 && !CLJ_DELIM.test(src[j])) j++;
+    toks.push(c === ':' ? { k: 'kw', v: src.slice(i, j), i } : { k: 'sym', v: src.slice(i, j), i });
+    i = j === i ? i + 1 : j;
+  }
+  return toks;
+}
+
+/** The tokens nested as forms: a form is an array whose open says what kind of bracket it was, else a token. */
+function cljTree(toks) {
+  const root = [];
+  const stack = [root];
+  for (const t of toks) {
+    const top = stack[stack.length - 1];
+    if (t.k === 'open') { const form = []; form.open = t.v; top.push(form); stack.push(form); }
+    else if (t.k === 'close') { if (stack.length > 1) stack.pop(); }
+    else top.push(t);
+  }
+  return root;
+}
+
+/** A form's items as the reader gives them: #_ drops the form after it, and #_#_a b drops both. */
+function cljItems(form) {
+  const out = [];
+  let skip = 0;
+  for (const x of form) {
+    if (x.k === 'discard') { skip++; continue; }
+    if (skip > 0) { skip--; continue; }
+    out.push(x);
+  }
+  return out;
+}
+
+/** The symbol a form starts with, past its decorations: (ns ^:no-doc foo.bar …) starts with ns. */
+function cljHead(items) {
+  for (const x of items) { if (CLJ_DECORATION.has(x.k)) continue; return x.k === 'sym' ? x.v : null; }
+  return null;
+}
+
+/** The :doc "…" of a metadata map, in the text a meta token kept. */
+function cljMetaDoc(metas) {
+  for (const m of metas) { const hit = /:doc\s+"([\s\S]*?)"/.exec(m); if (hit) return hit[1]; }
+  return null;
+}
+
+/** The :doc "…" of an attribute map form: (ns foo "doc" {:author "…"}) and (defn f {:doc "…"} [x]). */
+function cljMapDoc(map) {
+  const items = cljItems(map);
+  for (let i = 0; i < items.length - 1; i++) if (items[i].k === 'kw' && items[i].v === ':doc') return items[i + 1].k === 'str' ? items[i + 1].v : null;
+  return null;
+}
+
+/** The names a require hands this file: :refer [a b], :refer :all, :only [a], :rename {old new}. */
+function cljReferNames(items, imp) {
+  for (let i = 0; i < items.length; i++) {
+    const x = items[i];
+    if (x.k !== 'kw') continue;
+    const v = items[i + 1];
+    if (x.v === ':refer' || x.v === ':only' || x.v === ':refer-macros' || x.v === ':use-macros') {
+      if (Array.isArray(v)) {
+        for (const y of cljItems(v)) if (y.k === 'sym') imp.names.push(y.v);
+      } else if (v?.k === 'kw' && v.v === ':all') imp.names.push('*'); // everything it defines: resolve.mjs decides
+      i++;
+    } else if (x.v === ':rename') {
+      if (Array.isArray(v) && v.open === '{') {
+        const names = cljItems(v).filter((y) => y.k === 'sym');
+        for (let k = 1; k < names.length; k += 2) imp.names.push(names[k].v);
+      }
+      i++;
+    } else if (x.v === ':as-alias') { imp.aliasOnly = true; i++; } // names the namespace, doesn't load it
+    else if (x.v === ':as') i++;
+  }
+}
+
+/** One entry of (:require …), (:use …) or (require …): a namespace, a [ns :as x] vector, or a prefix list. */
+function cljRequireItem(item, prefix, imports, at) {
+  if (Array.isArray(item)) {
+    const items = cljItems(item).filter((x) => !CLJ_DECORATION.has(x.k));
+    const first = items[0];
+    if (!first) return;
+    if (first.k === 'kw') { for (const x of items.slice(1)) cljRequireItem(x, prefix, imports, at); return; } // #?(:clj [a] :cljs [b])
+    if (first.k === 'str') { // ["react" :as react]: a ClojureScript package from node_modules
+      const imp = { spec: first.v, names: [], kind: 'package', line: at(first.i) };
+      cljReferNames(items.slice(1), imp);
+      imports.push(imp);
+      return;
+    }
+    if (first.k !== 'sym') return;
+    // (quote [foo.bar :as fb]) is what '[foo.bar :as fb] reads as
+    if ((first.v === 'quote' || first.v === 'syntax-quote') && items.length === 2) { cljRequireItem(items[1], prefix, imports, at); return; }
+    const rest = items.slice(1);
+    // a prefix list: (eca.features [chat :as c] [tools :as t]) is eca.features.chat and eca.features.tools
+    if (rest.length && Array.isArray(rest[0])) {
+      const under = prefix ? `${prefix}.${first.v}` : first.v;
+      for (const x of rest) if (Array.isArray(x)) cljRequireItem(x, under, imports, at);
+      return;
+    }
+    const imp = { spec: (prefix ? `${prefix}.${first.v}` : first.v).split('/')[0], names: [], line: at(first.i) };
+    cljReferNames(rest, imp);
+    imports.push(imp);
+    return;
+  }
+  if (item.k !== 'sym') return;
+  imports.push({ spec: (prefix ? `${prefix}.${item.v}` : item.v).split('/')[0], names: [], line: at(item.i) });
+}
+
+/** A class import: java.net.Proxy$Type is declared by the file of the class around it. */
+function cljAddClass(imports, spec, at, offset) {
+  imports.push({ spec: spec.replace(/\$.*$/, ''), names: [], kind: 'class', line: at(offset) });
+}
+
+/** One entry of (:import …): java.io.File, [java.util UUID], (java.io File Writer), [java.net Proxy$Type]. */
+function cljImportItem(item, imports, at) {
+  if (item.k === 'sym') { cljAddClass(imports, item.v, at, item.i); return; }
+  if (!Array.isArray(item)) return;
+  const items = cljItems(item).filter((x) => !CLJ_DECORATION.has(x.k));
+  const first = items[0];
+  if (!first) return;
+  if (first.k === 'kw') { for (const x of items.slice(1)) cljImportItem(x, imports, at); return; } // a reader conditional
+  if (first.k !== 'sym') return;
+  if (items.length === 1) { cljAddClass(imports, first.v, at, first.i); return; }
+  for (const x of items.slice(1)) if (x.k === 'sym') cljAddClass(imports, `${first.v}.${x.v}`, at, x.i);
+}
+
+/**
+ * The (ns …) form: its name, its docstring (the description of the file) and the clauses holding what it
+ * requires and imports, reader-conditional clauses included.
+ */
+function cljNs(items, ctx, at) {
+  let i = 1;
+  for (; i < items.length; i++) {
+    if (CLJ_DECORATION.has(items[i].k)) continue;
+    if (items[i].k !== 'sym') return; // (ns) with no name: nothing to read
+    ctx.ns = items[i].v;
+    i++;
+    break;
+  }
+  let doc = null;
+  for (; i < items.length; i++) {
+    const x = items[i];
+    if (CLJ_DECORATION.has(x.k)) continue;
+    if (x.k === 'str' && !x.regex) { doc = doc || x.v; continue; }
+    if (Array.isArray(x) && x.open === '{') { doc = doc || cljMapDoc(x); continue; }
+    break;
+  }
+  ctx.doc = doc ? cleanDoc(doc) : null;
+  // the clauses, and the clauses inside a reader conditional: (ns foo #?(:clj (:require [a.b])))
+  const clauses = [];
+  const collect = (kids, depth) => {
+    for (const x of kids) {
+      if (!Array.isArray(x) || x.open !== '(') continue;
+      const parts = cljItems(x).filter((y) => !CLJ_DECORATION.has(y.k));
+      const head = parts[0];
+      if (!head || head.k !== 'kw') continue;
+      if (CLJ_NS_CLAUSES.has(head.v)) { clauses.push({ head: head.v, items: parts.slice(1) }); continue; }
+      if (CLJ_BRANCHES.has(head.v) && depth < 3) collect(parts.slice(1), depth + 1);
+    }
+  };
+  collect(items.slice(i), 0);
+  for (const clause of clauses) {
+    if (clause.head === ':import') for (const x of clause.items) cljImportItem(x, ctx.imports, at);
+    else for (const x of clause.items) cljRequireItem(x, '', ctx.imports, at);
+  }
+}
+
+/**
+ * A (def…) form: what it names, whether other files may use it, and the docstring after the name (or a
+ * ^{:doc "…"}). defn- and ^:private mark a def as the file's own, so decls leaves those out.
+ */
+function cljDef(items, ctx, at) {
+  const kind = CLJ_DEFS.get(items[0].v);
+  const metas = [];
+  let i = 1;
+  let name = null;
+  for (; i < items.length; i++) {
+    const x = items[i];
+    if (x.k === 'meta') { metas.push(x.v); continue; }
+    if (CLJ_DECORATION.has(x.k)) continue;
+    if (x.k !== 'sym') return;
+    name = x;
+    i++;
+    break;
+  }
+  if (!name) return;
+  let doc = cljMetaDoc(metas);
+  // the docstring sits between the name and the arglist… and a map there, (defn f {:private true} [x]), is attributes
+  for (; i < items.length; i++) {
+    const x = items[i];
+    if (x.k === 'meta') { metas.push(x.v); continue; }
+    if (Array.isArray(x) && x.open === '{') { doc = doc || cljMapDoc(x); continue; }
+    // (def name "value") is a value, not a docstring: only a string with something after it documents
+    if (x.k === 'str' && !x.regex && items.slice(i + 1).some((y) => !CLJ_DECORATION.has(y.k))) doc = doc || x.v;
+    break;
+  }
+  const priv = items[0].v === 'defn-' || metas.some((m) => m === ':private' || /:private\s+true/.test(m));
+  const text = doc ? cleanDoc(doc) : null;
+  ctx.symbols.push({ name: name.v, kind, line: at(name.i), ...(text ? { doc: text } : {}), ...(priv ? { priv: true } : {}) });
+}
+
+/** A top-level form: the ns, requires, defs, and every branch of a reader conditional around them. */
+function cljTop(items, ctx, at, depth = 0) {
+  let k = 0;
+  while (k < items.length && CLJ_DECORATION.has(items[k].k)) k++;
+  const headTok = items[k];
+  if (!headTok) return;
+  if (headTok.k === 'kw' && CLJ_BRANCHES.has(headTok.v) && depth < 3) {
+    for (const x of items.slice(k + 1)) if (Array.isArray(x)) cljTop(cljItems(x), ctx, at, depth + 1);
+    return;
+  }
+  if (headTok.k !== 'sym') return;
+  if (headTok.v === 'comment') return; // (comment …) is a block of code that never runs
+  if (headTok.v === 'ns') { cljNs(items, ctx, at); return; }
+  if (headTok.v === 'require' || headTok.v === 'require-macros' || headTok.v === 'use') {
+    for (const x of items.slice(k + 1)) cljRequireItem(x, '', ctx.imports, at);
+    return;
+  }
+  if (CLJ_DEFS.has(headTok.v)) cljDef(items, ctx, at);
+}
+
+function extractClojure(src) {
+  const toks = cljTokens(src);
+  const at = lineIndex(src);
+  const ctx = { imports: [], symbols: [], ns: null, doc: null };
+  // #_ at the top of a file drops the form after it, ns and defs included
+  for (const form of cljItems(cljTree(toks))) if (Array.isArray(form)) cljTop(cljItems(form), ctx, at);
+  // requiring-resolve / resolve: a namespace loaded when it's needed, which is how a Clojure app reaches a
+  // feature without requiring it up front. Read from the tokens, so a ; comment or a string can't fake one.
+  for (let i = 0; i < toks.length; i++) {
+    const t = toks[i];
+    if (t.k !== 'sym' || (t.v !== 'requiring-resolve' && t.v !== 'resolve')) continue;
+    let j = i + 1;
+    while (j < toks.length && CLJ_DECORATION.has(toks[j].k)) j++;
+    let arg = toks[j];
+    // (requiring-resolve (quote ns/var)) reads the same as 'ns/var
+    if (arg?.k === 'open' && toks[j + 1]?.k === 'sym' && toks[j + 1].v === 'quote' && toks[j + 2]?.k === 'sym') arg = toks[j + 2];
+    if (arg?.k !== 'sym' || !/[/.]/.test(arg.v)) continue; // (resolve 'inc) asks about a core var, not a file
+    ctx.imports.push({ spec: arg.v.split('/')[0], names: [], line: at(arg.i), dynamic: true });
+  }
+  // one import per namespace: a file that reaches for the same one twice names it once on the map
+  const imports = [];
+  const seen = new Map();
+  for (const imp of ctx.imports) {
+    const key = `${imp.kind || ''} ${imp.spec}`;
+    const had = seen.get(key);
+    if (!had) { seen.set(key, imp); imports.push(imp); continue; }
+    for (const n of imp.names) if (!had.names.includes(n)) had.names.push(n);
+    if (imp.aliasOnly) had.aliasOnly = true;
+    if (imp.dynamic) had.dynamic = true;
+  }
+  const decls = [...new Set(ctx.symbols.filter((s) => !s.priv).map((s) => s.name))];
+  return {
+    imports, symbols: ctx.symbols, routes: [], mounts: [],
+    // HTTP client calls are left out on purpose: (get m :k) is a map lookup in Clojure, so reading get and post
+    // the way JavaScript is read would invent requests that were never made.
+    calls: [], hosts: [],
+    ...(ctx.ns ? { ns: ctx.ns } : {}),
+    ...(ctx.doc ? { doc: ctx.doc } : {}),
+    ...(decls.length ? { decls } : {}),
+  };
+}
+
 // ---------- Shopify themes (Liquid) ----------
 // Theme files reach each other by name ({% render 'price' %} is snippets/price.liquid), turned here into relative paths.
 
@@ -2243,6 +2610,7 @@ function extractByLang(src, lang, filePath) {
     case 'rust': return extractRust(src);
     case 'swift': return extractSwift(src);
     case 'java': case 'kotlin': case 'scala': case 'groovy': return extractJvm(src);
+    case 'clojure': return extractClojure(src);
     case 'csharp': return extractCSharp(src);
     default: return extractSimple(src, lang);
   }
@@ -2371,6 +2739,9 @@ function phpHeader(lines, r) {
 }
 
 function addDocs(src, lang, r) {
+  // A Clojure file's docstrings sit inside its forms (after the ns name, after a def's name), not above them,
+  // so extractClojure has already read them.
+  if (lang === 'clojure') return;
   const lines = src.split('\n');
   r.doc = lang === 'python' ? pyDocAfter(lines, -1) : lang === 'liquid' ? liquidDoc(src) : lang === 'php' ? phpHeader(lines, r) : HASH_LANGS.has(lang) ? hashHeader(lines) : headerComment(lines);
   if (lang === 'liquid') return;
