@@ -415,6 +415,89 @@ export function createResolver(root, files) {
     return { external: parts.slice(0, Math.min(3, parts.length - 1)).join('.'), eco: 'maven' };
   };
 
+  // ---- Clojure ----
+  // A namespace is whatever its file says it is (ns eca.modules.loader), not where the file sits: src/, test/,
+  // dev/ and integration-test/ are all source roots, and a file's name doesn't have to match its ns. So files are
+  // indexed by the ns they declare and a require is looked up by name. A file with no ns form (a script) is found
+  // by its path instead, with the underscores Clojure file names use where the ns has dashes.
+  const CLJ_CORE = new Set(('clojure.core clojure.core.protocols clojure.core.reducers clojure.core.server ' +
+    'clojure.core.specs.alpha clojure.data clojure.datafy clojure.edn clojure.inspector clojure.instant ' +
+    'clojure.java.browse clojure.java.io clojure.java.javadoc clojure.java.process clojure.java.shell ' +
+    'clojure.main clojure.math clojure.pprint clojure.reflect clojure.repl clojure.set clojure.spec.alpha ' +
+    'clojure.spec.gen.alpha clojure.spec.test.alpha clojure.stacktrace clojure.string clojure.template ' +
+    'clojure.test clojure.test.junit clojure.test.tap clojure.uuid clojure.walk clojure.xml clojure.zip ' +
+    'cljs.core cljs.reader cljs.pprint cljs.test cljs.spec.alpha cljs.spec.gen.alpha cljs.spec.test.alpha ' +
+    'cljs.repl cljs.js cljs.math cljs.user cljs.analyzer cljs.env cljs.source-map').split(' '));
+  // cljs.* is ClojureScript's own, apart from the libraries that took its name space
+  const CLJS_LIB = new Set(['cljs.core.async', 'cljs.core.match', 'cljs.core.logic']);
+  // Which file a require reaches when one namespace is declared in more than one: a .cljs file can't use a .clj one
+  const CLJ_DIALECT = {
+    '.clj': ['.clj', '.cljc', '.cljs', '.bb'], '.cljc': ['.cljc', '.clj', '.cljs', '.bb'],
+    '.cljs': ['.cljs', '.cljc', '.clj', '.bb'], '.bb': ['.bb', '.clj', '.cljc', '.cljs'],
+  };
+  const CLJ_TEST = /(^|\/)(test|tests|spec)\//;
+  const cljIndex = new Map(); // namespace -> the files declaring it
+  const cljPathIndex = new Map(); // path tail (underscores) -> the files with no ns form
+  const cljFamilies = new Set(); // the first 1-2 segments of the project's own namespaces
+  for (const f of files) {
+    if (f.lang !== 'clojure') continue;
+    if (f.ns) {
+      const list = cljIndex.get(f.ns);
+      if (!list) cljIndex.set(f.ns, [f.path]);
+      else if (!list.includes(f.path)) list.push(f.path);
+      const segs = f.ns.split('.');
+      cljFamilies.add(segs[0]);
+      if (segs.length > 1) cljFamilies.add(`${segs[0]}.${segs[1]}`);
+      continue;
+    }
+    const segs = f.path.slice(0, -P.extname(f.path).length).split('/');
+    for (let k = 0; k < segs.length; k++) {
+      const key = segs.slice(k).join('/');
+      const list = cljPathIndex.get(key);
+      if (!list) cljPathIndex.set(key, [f.path]);
+      else if (!list.includes(f.path)) list.push(f.path);
+    }
+  }
+  /** The files a namespace names: by declared ns, else by path, in the dialect the requiring file can read. */
+  const cljFilesFor = (file, spec) => {
+    const wanted = spec.split('.').map((s) => s.replace(/-/g, '_')).join('/');
+    const found = cljIndex.get(spec) || cljPathIndex.get(wanted);
+    if (!found) return null;
+    // tests see the code they test, but nothing outside them sees a test's own namespace
+    const fromTest = CLJ_TEST.test(file.path);
+    const usable = found.filter((p) => fromTest || !CLJ_TEST.test(p));
+    if (!usable.length) return [];
+    for (const ext of CLJ_DIALECT[P.extname(file.path)] || ['.clj', '.cljc', '.cljs', '.bb']) {
+      const hit = usable.filter((p) => p.endsWith(ext));
+      if (hit.length) return hit;
+    }
+    return usable;
+  };
+  /**
+   * The library a namespace comes from: its first segment (cheshire.core is cheshire), or the first three where a
+   * family holds several libraries (clojure.core.async, clojure.data.json, org.httpkit.server, clojure.tools.namespace).
+   */
+  const CLJ_LIB_SPLIT = /^(clojure|cljs|org|com|io|net|dev|ai|co)$/;
+  const cljExternal = (spec) => {
+    const segs = spec.split('.');
+    if (segs.length < 2) return spec;
+    return segs.slice(0, CLJ_LIB_SPLIT.test(segs[0]) ? Math.min(3, segs.length) : 1).join('.');
+  };
+  const resolveClj = (file, imp) => {
+    if (imp.kind === 'class') return resolveJvm(file, imp); // a Java class: this project's first, then java.* as builtin
+    if (imp.kind === 'package') return { external: imp.spec, eco: 'npm' }; // ["react" :as react] in ClojureScript
+    // :as-alias names a namespace it never loads, but the file that declares it is a real answer for the map
+    const found = cljFilesFor(file, imp.spec);
+    if (found?.length === 1) return { file: found[0] };
+    if (found?.length > 1) return { files: found };
+    if (found) return { unresolved: true }; // declared only where tests can see it
+    if (CLJ_CORE.has(imp.spec) || (imp.spec.startsWith('cljs.') && !CLJS_LIB.has(imp.spec))) return { builtin: true };
+    const segs = imp.spec.split('.');
+    // under one of the project's own families but no file declares it: a name missing from the project, not a library
+    if (cljFamilies.has(segs[0]) || (segs.length > 1 && cljFamilies.has(`${segs[0]}.${segs[1]}`))) return { unresolved: true };
+    return { external: cljExternal(imp.spec), eco: 'clojars' };
+  };
+
   // ---- Swift ----
   // A Swift import names a module (a Swift package target), and the files of one module use each other's
   // code without importing anything. So a file links to the files declaring the top-level names it uses,
@@ -613,6 +696,7 @@ export function createResolver(root, files) {
       case 'go': return resolveGo(file.path, imp.spec);
       case 'rust': return resolveRust(file.path, imp);
       case 'java': case 'kotlin': case 'scala': case 'groovy': return resolveJvm(file, imp);
+      case 'clojure': return resolveClj(file, imp);
       case 'swift': return resolveSwift(file, imp);
       case 'csharp': return resolveCs(file, imp);
       case 'ruby': return resolveRelative(file.path, imp.spec, ['.rb']);
